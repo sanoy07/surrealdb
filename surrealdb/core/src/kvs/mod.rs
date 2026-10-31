@@ -229,6 +229,94 @@ pub(crate) mod testing {
 			non_retryable_errors().lock().unwrap().remove(&(self.site, self.node_id));
 		}
 	}
+
+	struct CleanupWatch {
+		commits: usize,
+		/// Stop after this many committed full batches. Cleared once it fires
+		/// so a later resume of the same node is not stopped again.
+		stop_after_full_batches: Option<usize>,
+		stopped: bool,
+	}
+
+	fn cleanup_watches() -> &'static Mutex<HashMap<Uuid, CleanupWatch>> {
+		static WATCHES: OnceLock<Mutex<HashMap<Uuid, CleanupWatch>>> = OnceLock::new();
+		WATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+	}
+
+	/// Count committed clean batches for `node_id`, and stop the clean after
+	/// `stop_after_full_batches` full batches.
+	///
+	/// The stop does not set the builder abort flag. Abort publishes phase
+	/// `Error`, and the resume scan does not adopt that. This leaves `Building`
+	/// in place, which is the state a crash between batches leaves behind.
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
+	pub(crate) fn watch_cleanup_batches(
+		node_id: Uuid,
+		stop_after_full_batches: usize,
+	) -> CleanupWatchGuard {
+		assert!(stop_after_full_batches > 0);
+		cleanup_watches().lock().unwrap().insert(
+			node_id,
+			CleanupWatch {
+				commits: 0,
+				stop_after_full_batches: Some(stop_after_full_batches),
+				stopped: false,
+			},
+		);
+		CleanupWatchGuard {
+			node_id,
+		}
+	}
+
+	/// Record one committed non-empty clean batch.
+	///
+	/// Returns true only when a full batch reaches the watch's stop threshold.
+	/// The caller must leave the build in `Building` without marking it aborted.
+	pub(crate) fn note_cleanup_batch_committed(node_id: Uuid, deleted: usize, full: bool) -> bool {
+		if deleted == 0 {
+			return false;
+		}
+		let mut watches = cleanup_watches().lock().unwrap();
+		let Some(slot) = watches.get_mut(&node_id) else {
+			return false;
+		};
+		slot.commits += 1;
+		if full && slot.stop_after_full_batches.is_some_and(|stop| slot.commits >= stop) {
+			slot.stop_after_full_batches = None;
+			slot.stopped = true;
+			return true;
+		}
+		false
+	}
+
+	/// Take the one-shot stop signal set by [`note_cleanup_batch_committed`].
+	pub(crate) fn take_cleanup_stopped(node_id: Uuid) -> bool {
+		let mut watches = cleanup_watches().lock().unwrap();
+		let Some(slot) = watches.get_mut(&node_id) else {
+			return false;
+		};
+		let stopped = slot.stopped;
+		slot.stopped = false;
+		stopped
+	}
+
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
+	pub(crate) struct CleanupWatchGuard {
+		node_id: Uuid,
+	}
+
+	impl CleanupWatchGuard {
+		#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
+		pub(crate) fn commits(&self) -> usize {
+			cleanup_watches().lock().unwrap().get(&self.node_id).map(|slot| slot.commits).unwrap_or(0)
+		}
+	}
+
+	impl Drop for CleanupWatchGuard {
+		fn drop(&mut self) {
+			cleanup_watches().lock().unwrap().remove(&self.node_id);
+		}
+	}
 }
 
 #[cfg(test)]

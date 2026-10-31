@@ -23,13 +23,14 @@ use crate::kvs::LockType::Optimistic;
 use crate::kvs::testing::{
 	NonRetryableErrorSite, RetryableConflictGuard, RetryableConflictSite,
 	inject_non_retryable_error, inject_retryable_conflict, inject_retryable_conflicts,
-	retryable_conflict_count,
+	retryable_conflict_count, watch_cleanup_batches,
 };
 use crate::kvs::tx::{
 	CachedIndexBuildReservationKey, CachedIndexBuildReservationLookup, IndexBuildReservationRelease,
 };
 use crate::kvs::{
-	Datastore, KVKey, KVValue, Key, TransactionType, is_retryable_transaction_conflict,
+	Datastore, INDEXING_BATCH_SIZE, KVKey, KVValue, Key, TransactionType,
+	is_retryable_transaction_conflict,
 };
 use crate::val::{RecordId, RecordIdKey, TableName, Value};
 
@@ -2007,6 +2008,286 @@ async fn resume_scan_adopts_stalled_concurrent_build() -> Result<()> {
 		.await?;
 	assert_eq!(resumed_again, 0, "healthy index must not be re-adopted");
 
+	Ok(())
+}
+
+/// `building.status = cleaning` is durable state, not a terminal phase.
+///
+/// Seed it directly: an expired owner is adopted and the clean finishes, and
+/// a still-live owner plus a reservation that would block takeover does not
+/// stop `REMOVE INDEX`.
+#[tokio::test(flavor = "multi_thread")]
+async fn seeded_cleaning_build_resumes_or_can_be_removed() -> Result<()> {
+	let (ds, session) = new_index_test_ds().await?;
+	execute_all(
+		&ds,
+		&session,
+		"
+			DEFINE TABLE user SCHEMALESS;
+			CREATE user:one SET email = 'one@example.com' RETURN NONE;
+			CREATE user:two SET email = 'two@example.com' RETURN NONE;
+			DEFINE INDEX test ON user FIELDS email;
+			",
+	)
+	.await?;
+	let (ns, db, table, ix) = get_table_index(&ds, "user", "test").await?;
+	let ikb = IndexKeyBase::new(ns, db, table.clone(), ix.index_id);
+	let prefix = index_all::new(ns, db, &table, ix.index_id);
+	let prefix_bytes = prefix.encode_key()?;
+	let marker = b"cleaning-strand";
+
+	// More keys than one clean batch, so the delete cannot be a single write.
+	let tx = ds.transaction(TransactionType::Write, Optimistic).await?;
+	for i in 0..INDEXING_BATCH_SIZE + 50u32 {
+		let mut key = prefix_bytes.clone();
+		key.extend_from_slice(marker);
+		key.extend_from_slice(&i.to_be_bytes());
+		tx.set(&key, &b"stale".to_vec()).await?;
+	}
+	let expired = Utc::now() - chrono::Duration::seconds(BUILD_OWNER_LEASE_SECS + 5);
+	tx.set(
+		&ikb.new_bs_key(),
+		&IndexBuildState {
+			generation: 4,
+			phase: IndexBuildPhase::Building,
+			owner: Some(Uuid::new_v4()),
+			next_ticket: 0,
+			initial_complete: false,
+			updated_at: expired,
+			owner_heartbeat_at: Some(expired),
+			error: None,
+			report_status: Some(IndexBuildReportStatus::Cleaning),
+			initial: None,
+			updated: None,
+			pending: None,
+		},
+	)
+	.await?;
+	tx.commit().await?;
+	assert_eq!(index_building_status(&ds, &session, "user", "test").await?, "cleaning");
+
+	let resumed = ds
+		.resume_stalled_index_builds(
+			Duration::from_secs(30),
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+	assert_eq!(resumed, 1, "an expired cleaning build should be adopted");
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		let state = durable_build_state(&ds, &ikb).await?;
+		if state.phase == IndexBuildPhase::Online {
+			break;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"seeded cleaning build stayed {:?}/{:?}",
+			state.phase,
+			state.report_status
+		);
+		sleep(Duration::from_millis(50)).await;
+	}
+	let range = crate::kvs::util::to_prefix_range(&prefix)?;
+	let tx = ds.transaction(TransactionType::Read, Optimistic).await?;
+	let left = catch!(tx, tx.keys(range, u32::MAX, 0, None).await);
+	tx.cancel().await?;
+	assert!(
+		left.iter().all(|key| !key.windows(marker.len()).any(|w| w == marker)),
+		"cleaning left stranded index keys behind"
+	);
+	assert_eq!(index_building_status(&ds, &session, "user", "test").await?, "ready");
+
+	// A live owner and a reservation that blocks takeover. REMOVE must still
+	// return, and it must not depend on that drain finishing.
+	let now = Utc::now();
+	let tx = ds.transaction(TransactionType::Write, Optimistic).await?;
+	tx.set(
+		&ikb.new_bs_key(),
+		&IndexBuildState {
+			generation: 5,
+			phase: IndexBuildPhase::Building,
+			owner: Some(Uuid::new_v4()),
+			next_ticket: 1,
+			initial_complete: false,
+			updated_at: now,
+			owner_heartbeat_at: Some(now),
+			error: None,
+			report_status: Some(IndexBuildReportStatus::Cleaning),
+			initial: None,
+			updated: None,
+			pending: None,
+		},
+	)
+	.await?;
+	tx.set(
+		&ikb.new_br_key(5, 0),
+		&IndexBuildReservation {
+			node: ds.id(),
+			expires_at: now + chrono::Duration::seconds(BUILD_RESERVATION_TTL_SECS),
+		},
+	)
+	.await?;
+	tx.commit().await?;
+	assert_eq!(index_building_status(&ds, &session, "user", "test").await?, "cleaning");
+
+	timeout(Duration::from_secs(2), execute_all(&ds, &session, "REMOVE INDEX test ON user"))
+		.await
+		.map_err(|_| anyhow::anyhow!("REMOVE INDEX hung on a seeded cleaning build"))??;
+
+	let tx = ds.transaction(TransactionType::Read, Optimistic).await?;
+	let gone = catch!(tx, tx.get_tb_index(ns, db, &table, "test", None).await);
+	let state_gone = catch!(tx, tx.get(&ikb.new_bs_key(), None).await);
+	tx.cancel().await?;
+	assert!(gone.is_none(), "REMOVE INDEX left the catalog entry");
+	assert!(state_gone.is_none(), "REMOVE INDEX left the cleaning build state");
+	Ok(())
+}
+
+async fn keys_under_prefix(ds: &Datastore, prefix: &(impl KVKey)) -> Result<Vec<Key>> {
+	let range = crate::kvs::util::to_prefix_range(prefix)?;
+	let tx = ds.transaction(TransactionType::Read, Optimistic).await?;
+	let keys = catch!(tx, tx.keys(range, u32::MAX, 0, None).await);
+	tx.cancel().await?;
+	Ok(keys)
+}
+
+/// One clean commits more than one batch, and a stop between those commits
+/// leaves a generation the resume scan can finish.
+///
+/// `abort()` is not this state. The task that observes abort publishes phase
+/// `Error`, and the resume scan does not adopt `Error`. A crash after a
+/// committed batch leaves `Building`, `initial_complete` false, and report
+/// `cleaning`. Already-deleted keys are not put back; the next scan only sees
+/// what is still under the prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleaning_batches_commit_and_resume_after_interrupt() -> Result<()> {
+	let (ds, session) = new_index_test_ds().await?;
+	execute_all(
+		&ds,
+		&session,
+		"
+			DEFINE TABLE user SCHEMALESS;
+			CREATE user:one SET email = 'one@example.com' RETURN NONE;
+			CREATE user:two SET email = 'two@example.com' RETURN NONE;
+			DEFINE INDEX test ON user FIELDS email;
+			",
+	)
+	.await?;
+	let (ns, db, table, ix) = get_table_index(&ds, "user", "test").await?;
+	let ikb = IndexKeyBase::new(ns, db, table.clone(), ix.index_id);
+	let prefix = index_all::new(ns, db, &table, ix.index_id);
+	let prefix_bytes = prefix.encode_key()?;
+	let marker = b"cleaning-strand";
+	let is_marker = |key: &Key| key.windows(marker.len()).any(|window| window == marker);
+
+	let tx = ds.transaction(TransactionType::Write, Optimistic).await?;
+	for i in 0..INDEXING_BATCH_SIZE + 50u32 {
+		let mut key = prefix_bytes.clone();
+		key.extend_from_slice(marker);
+		key.extend_from_slice(&i.to_be_bytes());
+		tx.set(&key, &b"stale".to_vec()).await?;
+	}
+	let expired = Utc::now() - chrono::Duration::seconds(BUILD_OWNER_LEASE_SECS + 5);
+	tx.set(
+		&ikb.new_bs_key(),
+		&IndexBuildState {
+			generation: 4,
+			phase: IndexBuildPhase::Building,
+			owner: Some(Uuid::new_v4()),
+			next_ticket: 0,
+			initial_complete: false,
+			updated_at: expired,
+			owner_heartbeat_at: Some(expired),
+			error: None,
+			report_status: Some(IndexBuildReportStatus::Cleaning),
+			initial: None,
+			updated: None,
+			pending: None,
+		},
+	)
+	.await?;
+	tx.commit().await?;
+
+	let before = keys_under_prefix(&ds, &prefix).await?;
+	assert!(before.len() > INDEXING_BATCH_SIZE as usize);
+	let watch = watch_cleanup_batches(ds.id(), 1);
+	let resumed = ds
+		.resume_stalled_index_builds(
+			Duration::from_secs(30),
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+	assert_eq!(resumed, 1, "expired cleaning build should be adopted");
+
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		if watch.commits() >= 1 {
+			assert_eq!(watch.commits(), 1, "the first pass must stop after one committed batch");
+			break;
+		}
+		assert!(Instant::now() < deadline, "first clean batch did not commit");
+		sleep(Duration::from_millis(20)).await;
+	}
+	let mut stalled = durable_build_state(&ds, &ikb).await?;
+	assert_eq!(stalled.phase, IndexBuildPhase::Building);
+	assert!(!stalled.initial_complete);
+	assert_eq!(stalled.generation, 4);
+	assert_eq!(stalled.report_status, Some(IndexBuildReportStatus::Cleaning));
+
+	let after_first = keys_under_prefix(&ds, &prefix).await?;
+	let removed: Vec<Key> = before.into_iter().filter(|key| !after_first.contains(key)).collect();
+	assert_eq!(removed.len(), INDEXING_BATCH_SIZE as usize, "one commit must delete one batch");
+	let removed_markers: Vec<Key> = removed.iter().filter(|key| is_marker(key)).cloned().collect();
+	assert!(!removed_markers.is_empty(), "the first batch deleted no marker keys");
+	assert!(after_first.iter().any(is_marker), "one batch cleaned the whole prefix");
+
+	// The batch commit refreshed the owner lease. Expire it again, without
+	// putting the deleted keys back, and let the resume scan finish.
+	let expired = Utc::now() - chrono::Duration::seconds(BUILD_OWNER_LEASE_SECS + 5);
+	stalled.owner_heartbeat_at = Some(expired);
+	stalled.updated_at = expired;
+	set_durable_build_state(&ds, &ikb, stalled).await?;
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		let resumed = ds
+			.resume_stalled_index_builds(
+				Duration::from_secs(30),
+				tokio_util::sync::CancellationToken::new(),
+			)
+			.await?;
+		if resumed == 1 {
+			break;
+		}
+		assert!(Instant::now() < deadline, "resume did not adopt the interrupted clean");
+		sleep(Duration::from_millis(20)).await;
+	}
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		let state = durable_build_state(&ds, &ikb).await?;
+		if state.phase == IndexBuildPhase::Online {
+			assert_eq!(state.generation, 4, "resume must keep the same generation");
+			break;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"interrupted clean stayed {:?}/{:?}",
+			state.phase,
+			state.report_status
+		);
+		sleep(Duration::from_millis(50)).await;
+	}
+	assert!(
+		watch.commits() >= 2,
+		"resume must commit another clean batch, commits={}",
+		watch.commits()
+	);
+	let end = keys_under_prefix(&ds, &prefix).await?;
+	assert!(
+		removed_markers.iter().all(|key| !end.contains(key)),
+		"an already-cleaned key came back; the resume should not need it"
+	);
+	assert!(end.iter().all(|key| !is_marker(key)), "markers remained after resume");
+	assert_eq!(index_building_status(&ds, &session, "user", "test").await?, "ready");
 	Ok(())
 }
 

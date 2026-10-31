@@ -35,7 +35,10 @@ use crate::key::record;
 use crate::kvs::LockType::Optimistic;
 use crate::kvs::ds::TransactionFactory;
 #[cfg(test)]
-use crate::kvs::testing::{RetryableConflictSite, maybe_inject_retryable_conflict};
+use crate::kvs::testing::{
+	RetryableConflictSite, maybe_inject_retryable_conflict, note_cleanup_batch_committed,
+	take_cleanup_stopped,
+};
 use crate::kvs::{
 	INDEXING_BATCH_SIZE, Transaction, TransactionType, is_retryable_transaction_conflict,
 };
@@ -975,6 +978,119 @@ impl Building {
 		Ok(true)
 	}
 
+	/// Delete index data for a restarted scan, one committed batch at a time.
+	///
+	/// Returns when the prefix is empty. An abort between batches returns
+	/// without an error; the caller checks [`Self::is_aborted`].
+	async fn delete_index_data_in_batches(&self, generation: BuildGeneration) -> Result<()> {
+		let prefix =
+			index_all::new(self.ix_key.ns, self.ix_key.db, &self.ix_key.tb, self.ix_key.ix);
+		let range = crate::kvs::util::to_prefix_range(&prefix)?;
+		'clean: loop {
+			if self.is_aborted().await {
+				return Ok(());
+			}
+			let ctx = self.new_write_tx_ctx().await?;
+			let tx = ctx.tx();
+			if let Err(err) = self
+				.maintain_build_ownership(&tx, generation, &[IndexBuildPhase::Building])
+				.await
+			{
+				if self
+					.cancel_and_retryable_conflict(
+						&tx,
+						&err,
+						"transient conflict maintaining build ownership, retrying",
+					)
+					.await
+				{
+					continue;
+				}
+				return Err(err);
+			}
+			let keys = match tx.keys(range.clone(), INDEXING_BATCH_SIZE, 0, None).await {
+				Ok(keys) => keys,
+				Err(err) => {
+					if self
+						.cancel_and_retryable_conflict(
+							&tx,
+							&err,
+							"transient conflict while cleaning existing index data, retrying",
+						)
+						.await
+					{
+						continue;
+					}
+					return Err(err);
+				}
+			};
+			for key in &keys {
+				if let Err(err) = tx.del(key).await {
+					if self
+						.cancel_and_retryable_conflict(
+							&tx,
+							&err,
+							"transient conflict while cleaning existing index data, retrying",
+						)
+						.await
+					{
+						continue 'clean;
+					}
+					return Err(err);
+				}
+			}
+			#[cfg(test)]
+			if let Err(err) = maybe_inject_retryable_conflict(
+				RetryableConflictSite::ConcurrentIndexInitialCleanup,
+				self.ctx.node_id(),
+			) {
+				if self
+					.cancel_and_retryable_conflict(
+						&tx,
+						&err,
+						"transient conflict while cleaning existing index data, retrying",
+					)
+					.await
+				{
+					continue;
+				}
+				return Err(err);
+			}
+			match tx.commit().await {
+				Ok(()) => {
+					#[cfg(test)]
+					if note_cleanup_batch_committed(
+						self.ctx.node_id(),
+						keys.len(),
+						(keys.len() as u32) >= INDEXING_BATCH_SIZE,
+					) {
+						// Crash between batches: the commit is durable, and
+						// this task stops without publishing `aborted`.
+						return Ok(());
+					}
+					// A short batch is the end of the prefix. A full one may
+					// have more keys, so scan again after this commit.
+					if (keys.len() as u32) < INDEXING_BATCH_SIZE {
+						return Ok(());
+					}
+				}
+				Err(err) => {
+					if self
+						.cancel_and_retryable_conflict(
+							&tx,
+							&err,
+							"transient conflict while cleaning existing index data, retrying",
+						)
+						.await
+					{
+						continue;
+					}
+					return Err(err);
+				}
+			}
+		}
+	}
+
 	#[cfg(test)]
 	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(super) async fn run(&self) -> Result<()> {
@@ -1022,76 +1138,19 @@ impl Building {
 				None,
 			)
 			.await?;
-			loop {
-				if self.is_aborted().await {
-					return Ok(());
-				}
-				let ctx = self.new_write_tx_ctx().await?;
-				let key =
-					index_all::new(self.ix_key.ns, self.ix_key.db, &self.ix_key.tb, self.ix_key.ix);
-				let tx = ctx.tx();
-				if let Err(err) = self
-					.maintain_build_ownership(&tx, generation, &[IndexBuildPhase::Building])
-					.await
-				{
-					if self
-						.cancel_and_retryable_conflict(
-							&tx,
-							&err,
-							"transient conflict maintaining build ownership, retrying",
-						)
-						.await
-					{
-						continue;
-					}
-					return Err(err);
-				}
-				if let Err(err) = tx.delp(&key).await {
-					if self
-						.cancel_and_retryable_conflict(
-							&tx,
-							&err,
-							"transient conflict while cleaning existing index data, retrying",
-						)
-						.await
-					{
-						continue;
-					}
-					return Err(err);
-				}
-				#[cfg(test)]
-				if let Err(err) = maybe_inject_retryable_conflict(
-					RetryableConflictSite::ConcurrentIndexInitialCleanup,
-					self.ctx.node_id(),
-				) {
-					if self
-						.cancel_and_retryable_conflict(
-							&tx,
-							&err,
-							"transient conflict while cleaning existing index data, retrying",
-						)
-						.await
-					{
-						continue;
-					}
-					return Err(err);
-				}
-				match tx.commit().await {
-					Ok(()) => break,
-					Err(err) => {
-						if self
-							.cancel_and_retryable_conflict(
-								&tx,
-								&err,
-								"transient conflict while cleaning existing index data, retrying",
-							)
-							.await
-						{
-							continue;
-						}
-						return Err(err);
-					}
-				}
+			// The prefix is deleted in committed batches. One `delp` of a large
+			// index is a single transaction: TiKV rejects it once the range cap
+			// is hit, and an unbounded delete holds `cleaning` until the process
+			// is killed. The status was already persisted, so that death leaves
+			// the index there. A batch commits, then checks abort, so a resume
+			// can finish the clean and `REMOVE INDEX` can stop it.
+			self.delete_index_data_in_batches(generation).await?;
+			#[cfg(test)]
+			if take_cleanup_stopped(self.ctx.node_id()) {
+				return Ok(());
+			}
+			if self.is_aborted().await {
+				return Ok(());
 			}
 
 			// First pass: index every record.
